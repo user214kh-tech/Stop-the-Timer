@@ -10,6 +10,11 @@ local localPlayer = Players.LocalPlayer
 local playerGui = localPlayer:WaitForChild("PlayerGui")
 local camera = Workspace.CurrentCamera
 
+--// UI Watch Targets (For Auto-Jump Integration)
+local gameUI = playerGui:WaitForChild("GameUI")
+local statusFrame = gameUI:WaitForChild("StatusFrame")
+local roundWins = statusFrame:WaitForChild("RoundWins")
+
 --// State
 local currentStationFolder = nil
 local currentSeatRole = "Player1"
@@ -192,6 +197,57 @@ local function spamClickTableButtonForLoss()
 	task.wait(0.01)
 
 	mouse1release(adjustedX, adjustedY)
+end
+
+--// =========================================
+--// INTEGRATED AUTO-JUMP UTILITIES (UPDATED FOR BLUE)
+--// =========================================
+local function isBlue(color)
+	-- Checks if the color has high blue and lower red/green values
+	return color.B > 0.8 and color.R < 0.4 and color.G < 0.6
+end
+
+local function checkFrameForBlue(frame)
+	if not frame:IsA("GuiObject") then return false end
+	if isBlue(frame.BackgroundColor3) then return true end
+	if frame:IsA("ImageLabel") or frame:IsA("ImageButton") then
+		if isBlue(frame.ImageColor3) then return true end
+	end
+	for _, child in ipairs(frame:GetChildren()) do
+		if child:IsA("GuiObject") then
+			if isBlue(child.BackgroundColor3) then return true end
+			if child:IsA("ImageLabel") or child:IsA("ImageButton") then
+				if isBlue(child.ImageColor3) then return true end
+			end
+			if child:IsA("TextLabel") then
+				if isBlue(child.TextColor3) then return true end
+			end
+		end
+	end
+	return false
+end
+
+local function checkOpponentWinsAndJump()
+	local blueWinCount = 0
+	
+	-- Scan frames '1', '2', '3' from RoundWins UI
+	for _, name in ipairs({"1", "2", "3"}) do
+		local winFrame = roundWins:FindFirstChild(name)
+		if winFrame and checkFrameForBlue(winFrame) then
+			blueWinCount = blueWinCount + 1
+		end
+	end
+	
+	-- Force a client-side jump to instantly get off the chair if down 2 points to Blue
+	if blueWinCount >= 2 then
+		local character = localPlayer.Character
+		if character then
+			local humanoid = character:FindFirstChildOfClass("Humanoid")
+			if humanoid then
+				humanoid.Jump = true
+			end
+		end
+	end
 end
 
 --// =========================================
@@ -446,6 +502,34 @@ makeDraggable(mainFrame, dragBar)
 makeDraggable(selectionFrame, selectionFrame)
 
 --// =========================================
+--// INITIALIZE EVENT LISTENERS FOR JUMPING
+--// =========================================
+local function hookUIListeners(folder)
+	for _, frame in ipairs(folder:GetChildren()) do
+		if frame:IsA("GuiObject") then
+			frame.Changed:Connect(checkOpponentWinsAndJump)
+			frame.ChildAdded:Connect(function(child)
+				if child:IsA("GuiObject") then
+					child.Changed:Connect(checkOpponentWinsAndJump)
+					checkOpponentWinsAndJump()
+				end
+			end)
+			for _, child in ipairs(frame:GetChildren()) do
+				if child:IsA("GuiObject") then
+					child.Changed:Connect(checkOpponentWinsAndJump)
+				end
+			end
+		end
+	end
+end
+
+hookUIListeners(roundWins)
+roundWins.ChildAdded:Connect(function(child)
+	checkOpponentWinsAndJump()
+	hookUIListeners(roundWins)
+end)
+
+--// =========================================
 --// MAIN LOOP
 --// =========================================
 RunService.Heartbeat:Connect(function()
@@ -533,3 +617,5 @@ RunService.Heartbeat:Connect(function()
 		end
 	end
 end)
+
+print("⚡ All-in-One Controller Loaded with Integrated Auto-Jump! Monitoring UI for Blue...")
