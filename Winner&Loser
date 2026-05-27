@@ -1,510 +1,535 @@
--- Services
+--// Services
 local Workspace = game:GetService("Workspace")
 local Players = game:GetService("Players")
 local CoreGui = game:GetService("CoreGui")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local VirtualInputManager = game:GetService("VirtualInputManager") -- Internal engine input service
+local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local localPlayer = Players.LocalPlayer
 local playerGui = localPlayer:WaitForChild("PlayerGui")
 local camera = Workspace.CurrentCamera
 
--- State tracking variables
+--// State
 local currentStationFolder = nil
-local currentStationName = "Scanning..."
 local currentSeatRole = "Player1"
+
 local autoClickEnabled = false
+local autoSeatEnabled = true
+
 local hasClickedThisRound = false
 local clickingMutex = false
-local hasLeftMatchThisGame = false -- Prevents jump spamming once you leave
 
--- Mode Selection Variable: "none", "winner", or "loser"
 local selectedGameMode = "none"
 
--- ==========================================
--- 1. DETECT THE EXACT CHAIR AND STATION NUMBER
--- ==========================================
-local function updateCurrentSeatLocation()
-    local character = localPlayer.Character
-    if not character then 
-        currentStationFolder = nil
-        currentStationName = "No Character Found"
-        return 
-    end
-    
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    if not humanoid or not humanoid.SeatPart or not humanoid.SeatPart:IsA("Seat") then
-        currentStationName = "Standby (Sit down at a table)"
-        return
-    end
-    
-    local mySeat = humanoid.SeatPart
-    local gameStations = Workspace:FindFirstChild("GameStations")
-    if not gameStations then return end
-    
-    for _, folder in ipairs({gameStations:FindFirstChild("Normal"), gameStations:FindFirstChild("Hard")}) do
-        if folder then
-            for _, station in ipairs(folder:GetChildren()) do
-                local chairsFolder = station:FindFirstChild("Chairs")
-                if chairsFolder then
-                    local p1Obj = chairsFolder:FindFirstChild("Player1")
-                    if p1Obj and (p1Obj == mySeat or p1Obj:IsAncestorOf(mySeat)) then
-                        currentStationFolder = station
-                        currentStationName = folder.Name .. " Table " .. station.Name
-                        currentSeatRole = "Player1"
-                        return
-                    end
-                    
-                    local p2Obj = chairsFolder:FindFirstChild("Player2")
-                    if p2Obj and (p2Obj == mySeat or p2Obj:IsAncestorOf(mySeat)) then
-                        currentStationFolder = station
-                        currentStationName = folder.Name .. " Table " .. station.Name
-                        currentSeatRole = "Player2"
-                        return
-                    end
-                end
-            end
-        end
-    end
+--// =========================================
+--// AUTO SEAT SYSTEM
+--// =========================================
+local function getTargetSeat()
+	local gs = Workspace:FindFirstChild("GameStations")
+	if not gs then return nil end
+
+	local normal = gs:FindFirstChild("Normal")
+	if not normal then return nil end
+
+	local station1 = normal:FindFirstChild("1")
+	if not station1 then return nil end
+
+	local chairs = station1:FindFirstChild("Chairs")
+	if not chairs then return nil end
+
+	local targetFolder
+
+	if selectedGameMode == "winner" then
+		targetFolder = chairs:FindFirstChild("Player1")
+	elseif selectedGameMode == "loser" then
+		targetFolder = chairs:FindFirstChild("Player2")
+	end
+
+	if targetFolder then
+		return targetFolder:FindFirstChild("Seat")
+	end
+
+	return nil
 end
 
--- ==========================================
--- 2. FETCH LIVE VALUE & GOAL TARGET
--- ==========================================
+--// =========================================
+--// CURRENT TABLE DETECTION
+--// =========================================
+local function updateCurrentSeatLocation()
+
+	local character = localPlayer.Character
+	if not character then return end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then return end
+
+	local seat = humanoid.SeatPart
+	if not seat then return end
+
+	local gameStations = Workspace:FindFirstChild("GameStations")
+	if not gameStations then return end
+
+	for _, folder in ipairs({
+		gameStations:FindFirstChild("Normal"),
+		gameStations:FindFirstChild("Hard")
+	}) do
+
+		if folder then
+			for _, station in ipairs(folder:GetChildren()) do
+
+				local chairs = station:FindFirstChild("Chairs")
+
+				if chairs then
+
+					local p1 = chairs:FindFirstChild("Player1")
+					local p2 = chairs:FindFirstChild("Player2")
+
+					if p1 and (p1 == seat or p1:IsAncestorOf(seat)) then
+						currentStationFolder = station
+						currentSeatRole = "Player1"
+						return
+					end
+
+					if p2 and (p2 == seat or p2:IsAncestorOf(seat)) then
+						currentStationFolder = station
+						currentSeatRole = "Player2"
+						return
+					end
+				end
+			end
+		end
+	end
+end
+
+--// =========================================
+--// TIMER
+--// =========================================
 local function getLiveTableTimerValue()
-    if not currentStationFolder then return nil end
-    
-    local timerModel = currentStationFolder:FindFirstChild("Timer")
-    if not timerModel then return nil end
-    
-    local playerDisplaySide = timerModel:FindFirstChild(currentSeatRole)
-    if playerDisplaySide and playerDisplaySide:FindFirstChild("SurfaceGui") then
-        local timerTextLabel = playerDisplaySide.SurfaceGui:FindFirstChildOfClass("TextLabel") or playerDisplaySide.SurfaceGui:FindFirstChild("TimerText")
-        if timerTextLabel then
-            return timerTextLabel.Text
-        end
-    end
-    return nil
+
+	if not currentStationFolder then return nil end
+
+	local timerModel = currentStationFolder:FindFirstChild("Timer")
+	if not timerModel then return nil end
+
+	local display = timerModel:FindFirstChild(currentSeatRole)
+
+	if display and display:FindFirstChild("SurfaceGui") then
+
+		local textLabel =
+			display.SurfaceGui:FindFirstChildOfClass("TextLabel")
+			or display.SurfaceGui:FindFirstChild("TimerText")
+
+		if textLabel then
+			return textLabel.Text
+		end
+	end
+
+	return nil
 end
 
 local function getCleanTargetTime()
-    if selectedGameMode == "winner" then
-        return "00.50" 
-    end
 
-    local gameUi = playerGui:FindFirstChild("GameUI")
-    if not gameUi then return nil end
-    
-    local secondsToSet = gameUi:FindFirstChild("SecondsToSet")
-    if secondsToSet and secondsToSet.Visible and secondsToSet.Text ~= "" then
-        local targetNum = string.match(secondsToSet.Text, "%d+%.%d+")
-        return targetNum
-    end
-    return nil
+	if selectedGameMode == "winner" then
+		return "00.50"
+	end
+
+	local gameUi = playerGui:FindFirstChild("GameUI")
+	if not gameUi then return nil end
+
+	local secondsToSet = gameUi:FindFirstChild("SecondsToSet")
+
+	if secondsToSet and secondsToSet.Visible then
+		local target = string.match(secondsToSet.Text, "%d+%.%d+")
+		return target
+	end
+
+	return nil
 end
 
--- ==========================================
--- 3. AUTO-RESET AND UNSTOPPABLE CLICK ENGINE
--- ==========================================
+--// =========================================
+--// CLICK FUNCTIONS
+--// =========================================
 local function clickPhysicalTableButton()
-    if clickingMutex then return end
-    clickingMutex = true
-    
-    task.spawn(function()
-        local viewportSize = camera.ViewportSize
-        local centerX = math.floor(viewportSize.X / 2)
-        local centerY = math.floor(viewportSize.Y / 2)
-        
-        local adjustedX = centerX + 45
-        local adjustedY = centerY + 45
-        
-        VirtualInputManager:SendMouseButtonEvent(adjustedX, adjustedY, 1, false, game, 0)
-        task.wait(0.01)
-        
-        mouse1press(adjustedX, adjustedY)
-        task.wait(0.06)
-        mouse1release(adjustedX, adjustedY)
-        
-        VirtualInputManager:SendMouseButtonEvent(adjustedX, adjustedY, 0, true, game, 0)
-        task.wait(0.03)
-        VirtualInputManager:SendMouseButtonEvent(adjustedX, adjustedY, 0, false, game, 0)
-        
-        task.wait(0.5) 
-        clickingMutex = false
-    end)
+
+	if clickingMutex then return end
+	clickingMutex = true
+
+	task.spawn(function()
+
+		local viewportSize = camera.ViewportSize
+
+		local centerX = math.floor(viewportSize.X / 2)
+		local centerY = math.floor(viewportSize.Y / 2)
+
+		local adjustedX = centerX + 45
+		local adjustedY = centerY + 45
+
+		mouse1press(adjustedX, adjustedY)
+
+		task.wait(0.05)
+
+		mouse1release(adjustedX, adjustedY)
+
+		task.wait(0.3)
+
+		clickingMutex = false
+	end)
 end
 
 local function spamClickTableButtonForLoss()
-    local viewportSize = camera.ViewportSize
-    local centerX = math.floor(viewportSize.X / 2)
-    local centerY = math.floor(viewportSize.Y / 2)
-    
-    local adjustedX = centerX + 45
-    local adjustedY = centerY + 45
-    
-    mouse1press(adjustedX, adjustedY)
-    task.wait(0.01)
-    mouse1release(adjustedX, adjustedY)
-    VirtualInputManager:SendMouseButtonEvent(adjustedX, adjustedY, 0, true, game, 0)
-    task.wait(0.01)
-    VirtualInputManager:SendMouseButtonEvent(adjustedX, adjustedY, 0, false, game, 0)
+
+	local viewportSize = camera.ViewportSize
+
+	local centerX = math.floor(viewportSize.X / 2)
+	local centerY = math.floor(viewportSize.Y / 2)
+
+	local adjustedX = centerX + 45
+	local adjustedY = centerY + 45
+
+	mouse1press(adjustedX, adjustedY)
+
+	task.wait(0.01)
+
+	mouse1release(adjustedX, adjustedY)
 end
 
--- ==========================================
--- 4. CREATE THE INTERFACE 
--- ==========================================
+--// =========================================
+--// GUI ROOT
+--// =========================================
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "PerfectClickTimerHUD"
 screenGui.ResetOnSpawn = false
 
-pcall(function() screenGui.Parent = CoreGui end)
-if not screenGui.Parent then screenGui.Parent = playerGui end
-
-local mainFrame = Instance.new("Frame")
-mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 260, 0, 200) 
-mainFrame.Position = UDim2.new(0.3, 0, 0.1, 0) 
-mainFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
-mainFrame.BorderSizePixel = 0
-mainFrame.Active = true 
-mainFrame.Visible = false 
-mainFrame.Parent = screenGui
-
-local uiCorner = Instance.new("UICorner")
-uiCorner.CornerRadius = UDim.new(0, 12)
-uiCorner.Parent = mainFrame
-
-local uiStroke = Instance.new("UIStroke")
-uiStroke.Color = Color3.fromRGB(80, 80, 180)
-uiStroke.Thickness = 2
-uiStroke.Parent = mainFrame
-
-local dragBar = Instance.new("Frame")
-dragBar.Name = "DragBar"
-dragBar.Size = UDim2.new(1, 0, 0, 30)
-dragBar.BackgroundColor3 = Color3.fromRGB(30, 30, 60)
-dragBar.BorderSizePixel = 0
-dragBar.Active = true 
-dragBar.Parent = mainFrame
-
-local dragCorner = Instance.new("UICorner")
-dragCorner.CornerRadius = UDim.new(0, 12)
-dragCorner.Parent = dragBar
-
-local stationHeaderLabel = Instance.new("TextLabel")
-stationHeaderLabel.Name = "StationHeaderLabel"
-stationHeaderLabel.Size = UDim2.new(1, 0, 1, 0)
-stationHeaderLabel.BackgroundTransparency = 1
-stationHeaderLabel.TextColor3 = Color3.fromRGB(180, 180, 255)
-stationHeaderLabel.TextSize = 13
-stationHeaderLabel.Font = Enum.Font.GothamBold
-stationHeaderLabel.Text = "⚡ AutoBot — Drag Here"
-stationHeaderLabel.Parent = dragBar
-
-local physicalTimerLabel = Instance.new("TextLabel")
-physicalTimerLabel.Name = "PhysicalTimerLabel"
-physicalTimerLabel.Size = UDim2.new(1, 0, 0, 35)
-physicalTimerLabel.Position = UDim2.new(0, 0, 0, 38)
-physicalTimerLabel.BackgroundTransparency = 1
-physicalTimerLabel.TextColor3 = Color3.fromRGB(100, 220, 255)
-physicalTimerLabel.TextSize = 34
-physicalTimerLabel.Font = Enum.Font.GothamBold
-physicalTimerLabel.Text = "00.00"
-physicalTimerLabel.Parent = mainFrame
-
-local targetLabel = Instance.new("TextLabel")
-targetLabel.Name = "TargetLabel"
-targetLabel.Size = UDim2.new(1, 0, 0, 15)
-targetLabel.Position = UDim2.new(0, 0, 0, 75)
-targetLabel.BackgroundTransparency = 1
-targetLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-targetLabel.TextSize = 12
-targetLabel.Font = Enum.Font.GothamBold
-targetLabel.Text = "Waiting for game to start..."
-targetLabel.Parent = mainFrame
-
-local scoreContainer = Instance.new("Frame")
-scoreContainer.Name = "ScoreContainer"
-scoreContainer.Size = UDim2.new(0, 140, 0, 28)
-scoreContainer.Position = UDim2.new(0.5, -70, 0, 98) 
-scoreContainer.BackgroundTransparency = 1
-scoreContainer.Parent = mainFrame
-
-local uiListLayout = Instance.new("UIListLayout")
-uiListLayout.FillDirection = Enum.FillDirection.Horizontal
-uiListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-uiListLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-uiListLayout.Padding = UDim.new(0, 10) 
-uiListLayout.Parent = scoreContainer
-
-local hudCircles = {}
-for i = 1, 3 do
-    local circle = Instance.new("ImageLabel")
-    circle.Name = "HUDCircle" .. i
-    circle.Size = UDim2.new(0, 24, 0, 24) 
-    circle.BackgroundColor3 = Color3.fromRGB(40, 40, 45) 
-    circle.BorderSizePixel = 0
-    circle.Parent = scoreContainer
-    
-    local circleCorner = Instance.new("UICorner")
-    circleCorner.CornerRadius = UDim.new(1, 0) 
-    circleCorner.Parent = circle
-    
-    local stroke = Instance.new("UIStroke")
-    stroke.Thickness = 1.5
-    stroke.Color = Color3.fromRGB(100, 100, 120)
-    stroke.Parent = circle
-    
-    hudCircles[i] = circle
-end
-
-local toggleButton = Instance.new("TextButton")
-toggleButton.Name = "ToggleButton"
-toggleButton.Size = UDim2.new(0.9, 0, 0, 34)
-toggleButton.Position = UDim2.new(0.05, 0, 0, 145)
-toggleButton.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
-toggleButton.Font = Enum.Font.GothamBold
-toggleButton.TextSize = 14
-toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-toggleButton.Text = "🔴 Auto-Clicker: OFF"
-toggleButton.Parent = mainFrame
-
-toggleButton.MouseButton1Click:Connect(function()
-    autoClickEnabled = not autoClickEnabled
-    if autoClickEnabled then
-        toggleButton.BackgroundColor3 = Color3.fromRGB(50, 180, 50)
-        toggleButton.Text = "🟢 Auto-Clicker: ON"
-    else
-        toggleButton.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
-        toggleButton.Text = "🔴 Auto-Clicker: OFF"
-    end
+pcall(function()
+	screenGui.Parent = CoreGui
 end)
 
-local btnCorner = Instance.new("UICorner")
-btnCorner.CornerRadius = UDim.new(0, 8)
-btnCorner.Parent = toggleButton
+if not screenGui.Parent then
+	screenGui.Parent = playerGui
+end
 
--- ==========================================
--- INTRO POPUP MODAL ("Who is playing?")
--- ==========================================
+--// =========================================
+--// MAIN GUI
+--// =========================================
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0,260,0,240)
+mainFrame.Position = UDim2.new(0.3,0,0.1,0)
+mainFrame.BackgroundColor3 = Color3.fromRGB(15,15,20)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Visible = false
+mainFrame.Parent = screenGui
+
+local mainCorner = Instance.new("UICorner", mainFrame)
+mainCorner.CornerRadius = UDim.new(0,12)
+
+local mainStroke = Instance.new("UIStroke", mainFrame)
+mainStroke.Color = Color3.fromRGB(80,80,180)
+mainStroke.Thickness = 2
+
+--// DRAG BAR
+local dragBar = Instance.new("Frame")
+dragBar.Size = UDim2.new(1,0,0,30)
+dragBar.BackgroundColor3 = Color3.fromRGB(30,30,60)
+dragBar.BorderSizePixel = 0
+dragBar.Active = true
+dragBar.Parent = mainFrame
+
+local dragCorner = Instance.new("UICorner", dragBar)
+dragCorner.CornerRadius = UDim.new(0,12)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1,0,1,0)
+title.BackgroundTransparency = 1
+title.Text = "⚡ AutoBot — Drag Here"
+title.TextColor3 = Color3.fromRGB(180,180,255)
+title.TextSize = 13
+title.Font = Enum.Font.GothamBold
+title.Parent = dragBar
+
+--// TIMER LABEL
+local timerLabel = Instance.new("TextLabel")
+timerLabel.Size = UDim2.new(1,0,0,35)
+timerLabel.Position = UDim2.new(0,0,0,38)
+timerLabel.BackgroundTransparency = 1
+timerLabel.Text = "00.00"
+timerLabel.TextColor3 = Color3.fromRGB(100,220,255)
+timerLabel.TextSize = 34
+timerLabel.Font = Enum.Font.GothamBold
+timerLabel.Parent = mainFrame
+
+--// STATUS LABEL
+local targetLabel = Instance.new("TextLabel")
+targetLabel.Size = UDim2.new(1,0,0,18)
+targetLabel.Position = UDim2.new(0,0,0,78)
+targetLabel.BackgroundTransparency = 1
+targetLabel.Text = "Waiting..."
+targetLabel.TextColor3 = Color3.fromRGB(255,255,255)
+targetLabel.TextSize = 12
+targetLabel.Font = Enum.Font.GothamBold
+targetLabel.Parent = mainFrame
+
+--// AUTO CLICK BUTTON
+local toggleButton = Instance.new("TextButton")
+toggleButton.Size = UDim2.new(0.9,0,0,34)
+toggleButton.Position = UDim2.new(0.05,0,0,125)
+toggleButton.BackgroundColor3 = Color3.fromRGB(180,50,50)
+toggleButton.Text = "🔴 Auto-Clicker: OFF"
+toggleButton.TextColor3 = Color3.fromRGB(255,255,255)
+toggleButton.TextSize = 14
+toggleButton.Font = Enum.Font.GothamBold
+toggleButton.Parent = mainFrame
+
+local toggleCorner = Instance.new("UICorner", toggleButton)
+toggleCorner.CornerRadius = UDim.new(0,8)
+
+toggleButton.MouseButton1Click:Connect(function()
+
+	autoClickEnabled = not autoClickEnabled
+
+	if autoClickEnabled then
+		toggleButton.BackgroundColor3 = Color3.fromRGB(50,180,50)
+		toggleButton.Text = "🟢 Auto-Clicker: ON"
+	else
+		toggleButton.BackgroundColor3 = Color3.fromRGB(180,50,50)
+		toggleButton.Text = "🔴 Auto-Clicker: OFF"
+	end
+end)
+
+--// AUTO SEAT BUTTON
+local seatButton = Instance.new("TextButton")
+seatButton.Size = UDim2.new(0.9,0,0,34)
+seatButton.Position = UDim2.new(0.05,0,0,170)
+seatButton.BackgroundColor3 = Color3.fromRGB(50,180,50)
+seatButton.Text = "🪑 Auto Seat: ON"
+seatButton.TextColor3 = Color3.fromRGB(255,255,255)
+seatButton.TextSize = 14
+seatButton.Font = Enum.Font.GothamBold
+seatButton.Parent = mainFrame
+
+local seatCorner = Instance.new("UICorner", seatButton)
+seatCorner.CornerRadius = UDim.new(0,8)
+
+seatButton.MouseButton1Click:Connect(function()
+
+	autoSeatEnabled = not autoSeatEnabled
+
+	if autoSeatEnabled then
+		seatButton.BackgroundColor3 = Color3.fromRGB(50,180,50)
+		seatButton.Text = "🪑 Auto Seat: ON"
+	else
+		seatButton.BackgroundColor3 = Color3.fromRGB(180,50,50)
+		seatButton.Text = "🪑 Auto Seat: OFF"
+	end
+end)
+
+--// =========================================
+--// SELECTION GUI
+--// =========================================
 local selectionFrame = Instance.new("Frame")
-selectionFrame.Name = "SelectionFrame"
-selectionFrame.Size = UDim2.new(0, 280, 0, 150)
-selectionFrame.Position = UDim2.new(0.5, -140, 0.4, -75)
-selectionFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
+selectionFrame.Size = UDim2.new(0,280,0,150)
+selectionFrame.Position = UDim2.new(0.5,-140,0.4,-75)
+selectionFrame.BackgroundColor3 = Color3.fromRGB(20,20,30)
 selectionFrame.BorderSizePixel = 0
 selectionFrame.Active = true
 selectionFrame.Parent = screenGui
 
-local selectCorner = Instance.new("UICorner")
-selectCorner.CornerRadius = UDim.new(0, 12)
-selectCorner.Parent = selectionFrame
+local selectCorner = Instance.new("UICorner", selectionFrame)
+selectCorner.CornerRadius = UDim.new(0,12)
 
-local selectStroke = Instance.new("UIStroke")
-selectStroke.Color = Color3.fromRGB(100, 100, 220)
+local selectStroke = Instance.new("UIStroke", selectionFrame)
+selectStroke.Color = Color3.fromRGB(100,100,220)
 selectStroke.Thickness = 2
-selectStroke.Parent = selectionFrame
 
 local questionLabel = Instance.new("TextLabel")
-questionLabel.Name = "QuestionLabel"
-questionLabel.Size = UDim2.new(1, 0, 0, 50)
+questionLabel.Size = UDim2.new(1,0,0,50)
 questionLabel.BackgroundTransparency = 1
-questionLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+questionLabel.Text = "Who is playing?"
+questionLabel.TextColor3 = Color3.fromRGB(255,255,255)
 questionLabel.TextSize = 18
 questionLabel.Font = Enum.Font.GothamBold
-questionLabel.Text = "Who is playing?"
 questionLabel.Parent = selectionFrame
 
 local loserButton = Instance.new("TextButton")
-loserButton.Name = "LoserButton"
-loserButton.Size = UDim2.new(0.42, 0, 0, 45)
-loserButton.Position = UDim2.new(0.06, 0, 0.5, 0)
-loserButton.BackgroundColor3 = Color3.fromRGB(180, 60, 60)
-loserButton.Font = Enum.Font.GothamBold
-loserButton.TextSize = 16
-loserButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+loserButton.Size = UDim2.new(0.42,0,0,45)
+loserButton.Position = UDim2.new(0.06,0,0.5,0)
+loserButton.BackgroundColor3 = Color3.fromRGB(180,60,60)
 loserButton.Text = "loser"
+loserButton.TextColor3 = Color3.fromRGB(255,255,255)
+loserButton.TextSize = 16
+loserButton.Font = Enum.Font.GothamBold
 loserButton.Parent = selectionFrame
 
-local loserCorner = Instance.new("UICorner")
-loserCorner.CornerRadius = UDim.new(0, 8)
-loserCorner.Parent = loserButton
+local loserCorner = Instance.new("UICorner", loserButton)
+loserCorner.CornerRadius = UDim.new(0,8)
 
 local winnerButton = Instance.new("TextButton")
-winnerButton.Name = "WinnerButton"
-winnerButton.Size = UDim2.new(0.42, 0, 0, 45)
-winnerButton.Position = UDim2.new(0.52, 0, 0.5, 0)
-winnerButton.BackgroundColor3 = Color3.fromRGB(60, 180, 80)
-winnerButton.Font = Enum.Font.GothamBold
-winnerButton.TextSize = 16
-winnerButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+winnerButton.Size = UDim2.new(0.42,0,0,45)
+winnerButton.Position = UDim2.new(0.52,0,0.5,0)
+winnerButton.BackgroundColor3 = Color3.fromRGB(60,180,80)
 winnerButton.Text = "winner"
+winnerButton.TextColor3 = Color3.fromRGB(255,255,255)
+winnerButton.TextSize = 16
+winnerButton.Font = Enum.Font.GothamBold
 winnerButton.Parent = selectionFrame
 
-local winnerCorner = Instance.new("UICorner")
-winnerCorner.CornerRadius = UDim.new(0, 8)
-winnerCorner.Parent = winnerButton
-
-loserButton.MouseButton1Click:Connect(function()
-    selectedGameMode = "loser"
-    selectionFrame:Destroy() 
-    mainFrame.Visible = true 
-end)
+local winnerCorner = Instance.new("UICorner", winnerButton)
+winnerCorner.CornerRadius = UDim.new(0,8)
 
 winnerButton.MouseButton1Click:Connect(function()
-    selectedGameMode = "winner"
-    selectionFrame:Destroy() 
-    mainFrame.Visible = true 
+	selectedGameMode = "winner"
+	selectionFrame.Visible = false
+	mainFrame.Visible = true
 end)
 
--- ==========================================
--- 5. DRAG MECHANICS
--- ==========================================
-local dragging, dragStart, startPos
-
-dragBar.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = true
-        dragStart = input.Position
-        startPos = mainFrame.Position
-        
-        input.Changed:Connect(function()
-            if input.UserInputState == Enum.UserInputState.End then
-                dragging = false
-            end
-        end)
-    end
+loserButton.MouseButton1Click:Connect(function()
+	selectedGameMode = "loser"
+	selectionFrame.Visible = false
+	mainFrame.Visible = true
 end)
 
-UserInputService.InputChanged:Connect(function(input)
-    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-        local delta = input.Position - dragStart
-        mainFrame.Position = UDim2.new(
-            startPos.X.Scale, 
-            startPos.X.Offset + delta.X, 
-            startPos.Y.Scale, 
-            startPos.Y.Offset + delta.Y
-        )
-    end
-end)
+--// =========================================
+--// DRAGGABLE GUI FUNCTION
+--// =========================================
+local function makeDraggable(frame, dragHandle)
 
--- ==========================================
--- 6. LIVE VISUAL AVATAR PROFILE & COLOR SYNCER 
---    + NEW: DETECT LOSS COUNT FOR AUTO-LEAVE
--- ==========================================
-local function syncRoundWinCircles()
-    local gameUi = playerGui:FindFirstChild("GameUI")
-    local totalOpponentWins = 0
-    
-    if gameUi then
-        local statusFrame = gameUi:FindFirstChild("StatusFrame")
-        if statusFrame then
-            local roundWins = statusFrame:FindFirstChild("RoundWins")
-            if roundWins then
-                for i = 1, 3 do
-                    local gameCircle = roundWins:FindFirstChild(tostring(i))
-                    local myHudCircle = hudCircles[i]
-                    
-                    if gameCircle and myHudCircle then
-                        if gameCircle:IsA("ImageLabel") then
-                            myHudCircle.Image = gameCircle.Image
-                            myHudCircle.ImageColor3 = gameCircle.ImageColor3
-                            myHudCircle.BackgroundColor3 = gameCircle.BackgroundColor3
-                        elseif gameCircle:FindFirstChildOfClass("ImageLabel") then
-                            local nestedImage = gameCircle:FindFirstChildOfClass("ImageLabel")
-                            myHudCircle.Image = nestedImage.Image
-                            myHudCircle.ImageColor3 = nestedImage.ImageColor3
-                            myHudCircle.BackgroundColor3 = gameCircle.BackgroundColor3
-                        else
-                            myHudCircle.BackgroundColor3 = gameCircle.BackgroundColor3
-                            myHudCircle.Image = ""
-                        end
-                        
-                        -- Check if opponent won this circle (circle is populated but it's NOT our profile)
-                        if gameCircle:IsA("ImageLabel") and gameCircle.Image ~= "" and gameCircle.Image ~= "rbxassetid://0" then
-                            local myHeadshot = Players:GetUserThumbnailAsync(localPlayer.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size420x420)
-                            if gameCircle.Image ~= myHeadshot then
-                                totalOpponentWins = totalOpponentWins + 1
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-    
-    -- NEW AUTO-LEAVE TRIGGER: If loser mode has lost twice, stand up automatically!
-    if selectedGameMode == "loser" and totalOpponentWins >= 2 and not hasLeftMatchThisGame then
-        local character = localPlayer.Character
-        if character then
-            local humanoid = character:FindFirstChildOfClass("Humanoid")
-            if humanoid and humanoid.SeatPart then
-                hasLeftMatchThisGame = true
-                humanoid.Jump = true -- Triggers character to break seat weld and jump out of match
-                targetLabel.Text = "❌ Lost twice! Jumped out."
-            end
-        end
-    end
+	local dragging = false
+	local dragInput
+	local dragStart
+	local startPos
+
+	dragHandle.InputBegan:Connect(function(input)
+
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+
+			dragging = true
+			dragStart = input.Position
+			startPos = frame.Position
+
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
+
+	dragHandle.InputChanged:Connect(function(input)
+
+		if input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch then
+
+			dragInput = input
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+
+		if input == dragInput and dragging then
+
+			local delta = input.Position - dragStart
+
+			frame.Position = UDim2.new(
+				startPos.X.Scale,
+				startPos.X.Offset + delta.X,
+				startPos.Y.Scale,
+				startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
 end
 
--- ==========================================
--- 7. RUNTIME TICK CONTROL LOOP
--- ==========================================
-RunService.Heartbeat:Connect(function()
-    updateCurrentSeatLocation()
-    syncRoundWinCircles() 
-    
-    local liveTime = getLiveTableTimerValue()
-    local targetTime = getCleanTargetTime()
-    
-    if liveTime then
-        physicalTimerLabel.Text = liveTime
-    else
-        physicalTimerLabel.Text = "00.00"
-    end
-    
-    -- Reset tracker flags when you are completely standing or table resets entirely
-    if liveTime == "00.00" or liveTime == "00.01" or tonumber(liveTime) == 0 or not currentStationFolder then
-        hasClickedThisRound = false
-        if not currentStationFolder then
-            hasLeftMatchThisGame = false -- Reset auto-leave filter when you successfully walk away
-        end
-    end
+--// MAKE BOTH GUIS DRAGGABLE
+makeDraggable(mainFrame, dragBar)
+makeDraggable(selectionFrame, selectionFrame)
 
-    if autoClickEnabled and liveTime and liveTime ~= "00.00" then
-        if selectedGameMode == "loser" then
-            targetLabel.Text = "Mode: FORCED LOSS (SPAM)"
-            if not hasClickedThisRound then
-                spamClickTableButtonForLoss()
-                hasClickedThisRound = true
-            end
-            
-        elseif selectedGameMode == "winner" and targetTime then
-            targetLabel.Text = "Mode: FORCED WIN (00.50)"
-            if not hasClickedThisRound and liveTime == targetTime then
-                hasClickedThisRound = true
-                clickPhysicalTableButton()
-            end
-            
-        elseif targetTime then
-            targetLabel.Text = "Target Time Goal: " .. targetTime
-            if not hasClickedThisRound and liveTime == targetTime then
-                hasClickedThisRound = true
-                clickPhysicalTableButton()
-            end
-        end
-    else
-        if selectedGameMode == "loser" then
-            if hasLeftMatchThisGame then
-                targetLabel.Text = "❌ Match Ended (Auto-Left)"
-            else
-                targetLabel.Text = "Mode: FORCED LOSS (SPAM)"
-            end
-        elseif selectedGameMode == "winner" then
-            targetLabel.Text = "Mode: FORCED WIN (00.50)"
-        else
-            targetLabel.Text = "Waiting for active time goal..."
-        end
-    end
+--// =========================================
+--// MAIN LOOP
+--// =========================================
+RunService.Heartbeat:Connect(function()
+
+	-- AUTO SEAT
+	if autoSeatEnabled and selectedGameMode ~= "none" then
+
+		local character = localPlayer.Character
+
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+
+		if humanoid and rootPart then
+
+			local targetSeat = getTargetSeat()
+
+			if targetSeat and targetSeat:IsA("Seat") then
+
+				if humanoid.SeatPart ~= targetSeat then
+
+					if targetSeat.Occupant and targetSeat.Occupant ~= humanoid then
+
+						seatButton.Text = "🪑 Seat Occupied!"
+
+					else
+
+						seatButton.Text = "🪑 Auto Seat: ON"
+
+						rootPart.CFrame = targetSeat.CFrame
+						targetSeat:Sit(humanoid)
+					end
+				end
+			end
+		end
+	end
+
+	updateCurrentSeatLocation()
+
+	local liveTime = getLiveTableTimerValue()
+	local targetTime = getCleanTargetTime()
+
+	if liveTime then
+		timerLabel.Text = liveTime
+	else
+		timerLabel.Text = "00.00"
+	end
+
+	if liveTime == "00.00"
+	or liveTime == "00.01"
+	or tonumber(liveTime) == 0
+	or not currentStationFolder then
+
+		hasClickedThisRound = false
+	end
+
+	if autoClickEnabled and liveTime and liveTime ~= "00.00" then
+
+		if selectedGameMode == "loser" then
+
+			targetLabel.Text = "Mode: FORCED LOSS"
+
+			if not hasClickedThisRound then
+				spamClickTableButtonForLoss()
+				hasClickedThisRound = true
+			end
+
+		elseif selectedGameMode == "winner" and targetTime then
+
+			targetLabel.Text = "Mode: FORCED WIN (00.50)"
+
+			if not hasClickedThisRound and liveTime == targetTime then
+				hasClickedThisRound = true
+				clickPhysicalTableButton()
+			end
+		end
+
+	else
+
+		if selectedGameMode == "winner" then
+			targetLabel.Text = "Mode: FORCED WIN"
+		elseif selectedGameMode == "loser" then
+			targetLabel.Text = "Mode: FORCED LOSS"
+		else
+			targetLabel.Text = "Waiting..."
+		end
+	end
 end)
